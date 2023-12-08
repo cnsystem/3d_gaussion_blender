@@ -37,7 +37,8 @@ C4 = [
 
 
 def SH2RGB(sh):
-    return sh * C0 + 0.5
+    c = sh.reshape(-1, 3) * C0 + 0.5
+    return np.concatenate([c, np.ones((c.shape[0],1))], axis=1)
 
 
 def load_ply(filepath):
@@ -75,9 +76,15 @@ def load_ply(filepath):
                         np.asarray(plydata.elements[0]["rot_1"]),
                         np.asarray(plydata.elements[0]["rot_2"]),
                         np.asarray(plydata.elements[0]["rot_3"])), axis=1)
-    
-    model_["color"] = SH2RGB(features_dc).reshape(N, 3)
-    
+
+    rot_euler = np.zeros((N, 3))
+    for i in range(N):
+        quat = mathutils.Quaternion(model_["quats"][i].tolist())
+        euler = quat.to_euler()
+        rot_euler[i] = (euler.x, euler.y, euler.z)
+
+    model_["rot_euler"] = rot_euler
+    model_["color"] = SH2RGB(features_dc).reshape(N, -1)
     return model_
 
 
@@ -100,8 +107,12 @@ def build_mesh(model_):
     # quat
     rot_quatw_attr = mesh.attributes.new(name="quat", type='QUATERNION', domain='POINT')
     rot_quatw_attr.data.foreach_set("value", model_["quats"].flatten())
-    color_attr = mesh.attributes.new(name="color", type='FLOAT_COLOR', domain='POINT')
-    color_attr.data.foreach_set("value", model_["color"].flatten())
+    #euler
+    rot_euler_attr = mesh.attributes.new(name="rot_euler", type='FLOAT_VECTOR', domain='POINT')
+    rot_euler_attr.data.foreach_set("vector", model_["rot_euler"].flatten())
+    #color
+    color_attr = mesh.color_attributes.new(name="color", type='FLOAT_COLOR', domain='POINT')
+    color_attr.data.foreach_set("color", model_["color"].flatten())
     # obj
     obj = bpy.data.objects.new("GaussianSplatting", mesh)
     bpy.context.collection.objects.link(obj)
@@ -454,9 +465,11 @@ def build_material_graph():
     mat_tree.links.new(math_node.outputs["Value"], principled_node.inputs["Alpha"])
     # Output
     mat_tree.links.new(principled_node.outputs["BSDF"], output_node.inputs["Surface"])
+    return mat
     
 
-def build_geometry_node(obj):
+def build_basic_geometry_node(obj):
+    obj.modifiers.clear()
     geo_node_mod = obj.modifiers.new(name="GeometryNodes", type='NODES')
     geo_tree = bpy.data.node_groups.new(name="GaussianSplatting", type='GeometryNodeTree')
     geo_node_mod.node_group = geo_tree
@@ -465,83 +478,88 @@ def build_geometry_node(obj):
     
     geo_tree.interface.new_socket('Geometry', description="", in_out='INPUT', socket_type='NodeSocketGeometry')
     geo_tree.interface.new_socket('Geometry', description="", in_out='OUTPUT', socket_type='NodeSocketGeometry')
-    #geo_tree.inputs.new('NodeSocketGeometry', "Geometry")
-    #geo_tree.outputs.new('NodeSocketGeometry', "Geometry")
+    return geo_tree
 
+
+def build_point_geometry_node(obj):
+    geo_tree = build_basic_geometry_node(obj)
     group_input_node = geo_tree.nodes.new('NodeGroupInput')
     group_input_node.location = (0, 0)
     group_output_node = geo_tree.nodes.new('NodeGroupOutput')
-    group_output_node.location = (1200, 0)
+    group_output_node.location = (600, 0)
     # mesh to points
     mesh_to_points_node = geo_tree.nodes.new('GeometryNodeMeshToPoints')
     mesh_to_points_node.location = (200, 0)
     mesh_to_points_node.inputs["Radius"].default_value = 0.01
     # percent to vis
+    set_point_radius_node = geo_tree.nodes.new('GeometryNodeSetPointRadius')
+    set_point_radius_node.location = (400, 0)
+    # Scale
+    scale_attr = geo_tree.nodes.new('GeometryNodeInputNamedAttribute')
+    scale_attr.location = (200, -200)
+    scale_attr.data_type = 'FLOAT_VECTOR'
+    scale_attr.inputs["Name"].default_value = "scale"
+
+    geo_tree.links.new(group_input_node.outputs["Geometry"], mesh_to_points_node.inputs["Mesh"])
+    geo_tree.links.new(mesh_to_points_node.outputs["Points"], set_point_radius_node.inputs["Points"])
+    geo_tree.links.new(scale_attr.outputs["Attribute"], set_point_radius_node.inputs["Radius"])
+    geo_tree.links.new(set_point_radius_node.outputs["Points"], group_output_node.inputs["Geometry"])
+    
+
+def build_sphere_geometry_node(obj, mat):
+    geo_tree = build_basic_geometry_node(obj)
+    group_input_node = geo_tree.nodes.new('NodeGroupInput')
+    group_input_node.location = (0, 400)
+    group_output_node = geo_tree.nodes.new('NodeGroupOutput')
+    group_output_node.location = (1200, 0)
+    # percent
     random_value_node = geo_tree.nodes.new('FunctionNodeRandomValue')
-    random_value_node.location = (0, 400)
+    random_value_node.location = (0, 200)
     random_value_node.data_type = 'BOOLEAN'
     random_value_node.inputs["Probability"].default_value = 0.1
-    maximum_node = geo_tree.nodes.new('ShaderNodeMath')
-    maximum_node.location = (0, 400)
-    maximum_node.operation = 'MAXIMUM'
-    is_point_cloud_node = geo_tree.nodes.new('FunctionNodeInputBool')
-    is_point_cloud_node.location = (0, 600)
-    is_point_cloud_node.boolean = True
+    # Scale
+    scale_attr = geo_tree.nodes.new('GeometryNodeInputNamedAttribute')
+    scale_attr.location = (200, -400)
+    scale_attr.data_type = 'FLOAT_VECTOR'
+    scale_attr.inputs["Name"].default_value = "scale"
+    # euler
+    rot_euler_attr = geo_tree.nodes.new('GeometryNodeInputNamedAttribute')
+    rot_euler_attr.location = (200, -200)
+    rot_euler_attr.data_type = 'FLOAT_VECTOR'
+    rot_euler_attr.inputs["Name"].default_value = "rot_euler"
+    # mesh to points
+    mesh_to_points_node = geo_tree.nodes.new('GeometryNodeMeshToPoints')
+    mesh_to_points_node.location = (200, 200)
+    mesh_to_points_node.inputs["Radius"].default_value = 0.01
+    # sphere
     ico_node = geo_tree.nodes.new('GeometryNodeMeshIcoSphere')
-    ico_node.location = (200, 200)
+    ico_node.location = (200, 0)
     ico_node.inputs["Subdivisions"].default_value = 1
     ico_node.inputs["Radius"].default_value = 1
     set_shade_smooth_node = geo_tree.nodes.new('GeometryNodeSetShadeSmooth')
-    set_shade_smooth_node.location = (200, 200)
+    set_shade_smooth_node.location = (400, 0)
     instance_node = geo_tree.nodes.new('GeometryNodeInstanceOnPoints')
-    instance_node.location = (400, 0)
-    switch_node = geo_tree.nodes.new('GeometryNodeSwitch')
-    switch_node.location = (600, 0)
-    switch_node.input_type = 'GEOMETRY'
+    instance_node.location = (600, 0)
+    # material
     set_material_node = geo_tree.nodes.new('GeometryNodeSetMaterial')
     set_material_node.location = (800, 0)
     set_material_node.inputs["Material"].default_value = mat
-    set_point_radius_node = geo_tree.nodes.new('GeometryNodeSetPointRadius')
-    set_point_radius_node.location = (200, 400)
     realize_instances_node = geo_tree.nodes.new('GeometryNodeRealizeInstances')
     realize_instances_node.location = (1000, 0)
+
     geo_tree.links.new(group_input_node.outputs["Geometry"], mesh_to_points_node.inputs["Mesh"])
-    # selection = max(random , is_point_cloud_node)
-    geo_tree.links.new(is_point_cloud_node.outputs["Boolean"], maximum_node.inputs[0])
-    geo_tree.links.new(random_value_node.outputs[3], maximum_node.inputs[1])
-    geo_tree.links.new(maximum_node.outputs["Value"], mesh_to_points_node.inputs["Selection"])
-    #
+    geo_tree.links.new(random_value_node.outputs[3], mesh_to_points_node.inputs["Selection"])
+    geo_tree.links.new(mesh_to_points_node.outputs["Points"], instance_node.inputs["Points"])
     geo_tree.links.new(ico_node.outputs["Mesh"], set_shade_smooth_node.inputs["Geometry"])
     geo_tree.links.new(set_shade_smooth_node.outputs["Geometry"], instance_node.inputs["Instance"])
-    # 
-    geo_tree.links.new(is_point_cloud_node.outputs["Boolean"], switch_node.inputs[1])
-    geo_tree.links.new(instance_node.outputs["Instances"], switch_node.inputs[14])
-    geo_tree.links.new(mesh_to_points_node.outputs["Points"], set_point_radius_node.inputs["Points"])
-    geo_tree.links.new(set_point_radius_node.outputs["Points"], switch_node.inputs[15])
-    geo_tree.links.new(switch_node.outputs[6], set_material_node.inputs["Geometry"])
-    geo_tree.links.new(mesh_to_points_node.outputs["Points"], instance_node.inputs["Points"])
+    geo_tree.links.new(rot_euler_attr.outputs["Attribute"], instance_node.inputs["Rotation"])
+    geo_tree.links.new(scale_attr.outputs["Attribute"], instance_node.inputs["Scale"])
+    geo_tree.links.new(instance_node.outputs["Instances"], set_material_node.inputs["Geometry"])
     geo_tree.links.new(set_material_node.outputs["Geometry"], realize_instances_node.inputs["Geometry"])
     geo_tree.links.new(realize_instances_node.outputs["Geometry"], group_output_node.inputs["Geometry"])
-    # Scale
-    scale_attr = geo_tree.nodes.new('GeometryNodeInputNamedAttribute')
-    scale_attr.location = (0, 200)
-    scale_attr.data_type = 'FLOAT_VECTOR'
-    scale_attr.inputs["Name"].default_value = "scale"
-    scale_node = geo_tree.nodes.new('ShaderNodeVectorMath')
-    scale_node.operation = 'SCALE'
-    scale_node.location = (0, 200)
-    scale_node.inputs["Scale"].default_value = 2
-    #avg
-    avg_node = geo_tree.nodes.new('ShaderNodeVectorMath')
-    avg_node.operation = 'DOT_PRODUCT'
-    avg_node.inputs[1].default_value = (1/3, 1/3, 1/3)
-    geo_tree.links.new(scale_attr.outputs["Attribute"], scale_node.inputs[0])
-    geo_tree.links.new(scale_node.outputs["Vector"], instance_node.inputs["Scale"])
-    geo_tree.links.new(scale_node.outputs["Vector"], avg_node.inputs[0])
-    geo_tree.links.new(avg_node.outputs["Value"], set_point_radius_node.inputs["Radius"])
-    # Rotation
+
+    # quats
     quat_attr = geo_tree.nodes.new('GeometryNodeInputNamedAttribute')
-    quat_attr.location = (0, 400)
+    quat_attr.location = (-200, 0)
     quat_attr.data_type = 'QUATERNION'
     quat_attr.inputs["Name"].default_value = "quats"
-    geo_tree.links.new(quat_attr.outputs["Attribute"], instance_node.inputs["Rotation"])
